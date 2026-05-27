@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 
+use rlp::{Rlp, RlpStream};
 use sha3::{Digest, Keccak256};
-use rlp::{Rlp,RlpStream}; 
-
 
 type Hash = [u8; 32];
 type Address = [u8; 20];
 
-// keccak256(data)
+// Hash arbitrary bytes with Keccak-256, the hash function used by Ethereum.
 fn keccak256(data: &[u8]) -> Hash {
     let digest = Keccak256::digest(data);
 
@@ -17,6 +16,7 @@ fn keccak256(data: &[u8]) -> Hash {
     hash
 }
 
+// Convert each byte into two 4-bit nibbles so the trie can branch 16 ways.
 fn bytes_to_nibbles(bytes: &[u8]) -> Vec<usize> {
     let mut nibbles = Vec::with_capacity(bytes.len() * 2);
 
@@ -30,6 +30,8 @@ fn bytes_to_nibbles(bytes: &[u8]) -> Vec<usize> {
 
     nibbles
 }
+
+// A minimal Ethereum-like account payload stored as the trie value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Account {
     nonce: u64,
@@ -39,15 +41,17 @@ struct Account {
 }
 
 impl Account {
+    // Create a simple externally owned account with empty storage and code.
     fn new_eoa(nonce: u64, balance: u64) -> Self {
-        Self { 
-            nonce, 
-            balance, 
-            storage_root: [0; 32], 
-            code_hash: [0; 32], 
+        Self {
+            nonce,
+            balance,
+            storage_root: [0; 32],
+            code_hash: [0; 32],
         }
     }
 
+    // Encode accounts as RLP so the stored bytes have a deterministic hash.
     fn encode(&self) -> Vec<u8> {
         let mut stream = RlpStream::new_list(4);
 
@@ -59,6 +63,7 @@ impl Account {
         stream.out().to_vec()
     }
 
+    // Decode the exact RLP format produced by Account::encode.
     fn decode(bytes: &[u8]) -> Self {
         let rlp = Rlp::new(bytes);
 
@@ -77,14 +82,16 @@ impl Account {
         let mut code_hash = [0u8; 32];
         code_hash.copy_from_slice(&code_hash_vec);
 
-        Self { 
-            nonce, 
-            balance, 
-            storage_root, 
-            code_hash 
+        Self {
+            nonce,
+            balance,
+            storage_root,
+            code_hash,
         }
     }
 }
+
+// A radix branch node has one child slot per nibble plus an optional value.
 #[derive(Debug, Clone)]
 struct BranchNode {
     children: [Option<Hash>; 16],
@@ -93,12 +100,13 @@ struct BranchNode {
 
 impl BranchNode {
     fn new() -> Self {
-        BranchNode { 
-            children: [None; 16], 
-            value: None 
+        BranchNode {
+            children: [None; 16],
+            value: None,
         }
     }
 
+    // RLP layout: 16 child hash fields followed by the value field.
     fn encode(&self) -> Vec<u8> {
         let mut stream = RlpStream::new_list(17);
 
@@ -112,7 +120,6 @@ impl BranchNode {
                     stream.append_empty_data();
                 }
             }
-
         }
 
         match &self.value {
@@ -122,12 +129,12 @@ impl BranchNode {
             None => {
                 stream.append_empty_data();
             }
-
         }
 
         stream.out().to_vec()
     }
 
+    // Decode a branch node and rebuild empty child slots from empty RLP fields.
     fn decode(bytes: &[u8]) -> Self {
         let rlp = Rlp::new(bytes);
 
@@ -161,6 +168,7 @@ impl BranchNode {
     }
 }
 
+// Content-addressed node storage: hash(encoded_node) -> encoded_node.
 type NodeDb = HashMap<Hash, Vec<u8>>;
 
 #[derive(Debug, Clone)]
@@ -171,16 +179,18 @@ struct MerkleRadixTrie {
 
 impl MerkleRadixTrie {
     fn new() -> Self {
-        MerkleRadixTrie { 
-            db: HashMap::new(), 
-            root: None, 
+        MerkleRadixTrie {
+            db: HashMap::new(),
+            root: None,
         }
     }
 
+    // Return the current root hash; an empty trie uses the zero hash sentinel.
     fn root_hash(&self) -> Hash {
-        [0; 32]
+        self.root.unwrap_or([0u8; 32])
     }
 
+    // Insert by walking the key nibble by nibble and rebuilding hashes upward.
     fn insert(&mut self, key: &[u8], value: Vec<u8>) {
         let nibbles = bytes_to_nibbles(key);
 
@@ -189,34 +199,25 @@ impl MerkleRadixTrie {
         self.root = Some(new_root);
     }
 
-    fn insert_at(
-        &mut self,
-        node_hash: Option<Hash>,
-        nibbles: &[usize],
-        value: &[u8],
-    ) -> Hash {
+    fn insert_at(&mut self, node_hash: Option<Hash>, nibbles: &[usize], value: &[u8]) -> Hash {
+        // Existing nodes are immutable by hash; decode, modify, then store a new hash.
         let mut node = match node_hash {
             Some(hash) => {
                 let encoded_hash = self.db.get(&hash).expect("missing node in db");
                 BranchNode::decode(encoded_hash)
             }
-            None => {
-                BranchNode::new()
-            }
+            None => BranchNode::new(),
         };
 
         if nibbles.is_empty() {
+            // The full key has been consumed, so the account bytes live here.
             node.value = Some(value.to_vec());
         } else {
             let index = nibbles[0];
 
             let old_child_hash = node.children[index];
 
-            let new_child_hash = self.insert_at(
-                old_child_hash, 
-                &nibbles[1..], 
-                value
-            );
+            let new_child_hash = self.insert_at(old_child_hash, &nibbles[1..], value);
 
             node.children[index] = Some(new_child_hash);
         }
@@ -224,14 +225,16 @@ impl MerkleRadixTrie {
         let encoded_node = node.encode();
         let node_hash = keccak256(&encoded_node);
 
+        // Store the new version of this node under its content hash.
         self.db.insert(node_hash, encoded_node);
 
         node_hash
     }
 
+    // Look up a value by following the child hash selected by each key nibble.
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let nibbles = bytes_to_nibbles(key);
-        
+
         let mut current_hash = self.root?;
 
         for nibble in nibbles {
@@ -244,22 +247,68 @@ impl MerkleRadixTrie {
 
         let encoded_node = self.db.get(&current_hash)?;
         let node = BranchNode::decode(encoded_node);
-        
+
         node.value
     }
 
+    // Return every encoded node on the path from root to the key's value node.
     fn prove(&self, key: &[u8]) -> Option<Vec<Vec<u8>>> {
-        None
+        let nibbles = bytes_to_nibbles(key);
+
+        let mut proof = Vec::new();
+        let mut current_hash = self.root?;
+        for nibble in nibbles {
+            let encoded_node = self.db.get(&current_hash)?.clone();
+            let node = BranchNode::decode(&encoded_node);
+
+            proof.push(encoded_node);
+            current_hash = node.children[nibble]?;
+        }
+
+        let encoded_node = self.db.get(&current_hash)?.clone();
+        proof.push(encoded_node);
+
+        Some(proof)
     }
 }
 
-fn verify_proof(
-    root: Hash,
-    key: &[u8],
-    expected_value: &[u8],
-    proof: &[Vec<u8>],
-) -> bool {
-    true
+// Verify that a proof connects the given root hash to the expected key/value.
+fn verify_proof(root: Hash, key: &[u8], expected_value: &[u8], proof: &[Vec<u8>]) -> bool {
+    let nibbles = bytes_to_nibbles(key);
+
+    // This toy trie has one branch node per nibble plus the final value node.
+    if proof.len() != nibbles.len() + 1 {
+        return false;
+    }
+
+    let mut expected_hash = root;
+    for depth in 0..proof.len() {
+        let encoded_node = &proof[depth];
+        let actual_hash = keccak256(encoded_node);
+
+        // Each proof node must hash to the parent reference we expected.
+        if expected_hash != actual_hash {
+            return false;
+        }
+
+        let node = BranchNode::decode(encoded_node);
+
+        if depth == nibbles.len() {
+            return node.value.as_deref() == Some(expected_value);
+        }
+
+        let nibble = nibbles[depth];
+        match node.children[nibble] {
+            None => {
+                return false;
+            }
+            Some(child_hash) => {
+                // The next proof item must match this child hash.
+                expected_hash = child_hash;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -269,13 +318,16 @@ struct AccountTrie {
 
 impl AccountTrie {
     fn new() -> Self {
-        AccountTrie { trie: MerkleRadixTrie::new() }
+        AccountTrie {
+            trie: MerkleRadixTrie::new(),
+        }
     }
 
     fn root_hash(&self) -> Hash {
         self.trie.root_hash()
     }
 
+    // Ethereum account trie keys are keccak256(address), not raw addresses.
     fn insert_account(&mut self, address: Address, account: Account) {
         let account_key = keccak256(&address);
         let encode_account = account.encode();
@@ -283,23 +335,31 @@ impl AccountTrie {
         self.trie.insert(&account_key, encode_account);
     }
 
+    // Load account bytes from the trie and decode them back into Account.
     fn get_account(&self, address: Address) -> Option<Account> {
         let account_key = keccak256(&address);
         let encoded_account = self.trie.get(&account_key)?;
         Some(Account::decode(&encoded_account))
     }
 
+    // Build an account proof using the hashed account key.
     fn prove_account(&self, address: Address) -> Option<Vec<Vec<u8>>> {
-        None
+        let account_key = keccak256(&address);
+
+        self.trie.prove(&account_key)
     }
 
+    // Recreate the account key and encoded value before verifying the trie proof.
     fn verify_account_proof(
         root: Hash,
         address: Address,
         account: &Account,
         proof: &[Vec<u8>],
     ) -> bool {
-        true
+        let account_key = keccak256(&address);
+        let encoded_account = Account::encode(account);
+
+        verify_proof(root, &account_key, &encoded_account, proof)
     }
 }
 
@@ -338,6 +398,11 @@ fn main() {
 
     println!();
     println!("=== root ===");
+    let root = account_trie.root_hash();
+    print_hash("account trie root", root);
+
+    println!();
+    println!("=== read account ===");
     let loaded_alice = account_trie
         .get_account(alice)
         .expect("alice account should exist");
@@ -346,6 +411,27 @@ fn main() {
 
     assert_eq!(loaded_alice, alice_account);
 
-    
+    println!();
+    println!("=== generate proof ===");
+    let proof = account_trie
+        .prove_account(alice)
+        .expect("proof should exist");
 
+    println!("proof node count: {}", proof.len());
+
+    println!();
+    println!("=== verify proof ===");
+    let ok = AccountTrie::verify_account_proof(root, alice, &alice_account, &proof);
+
+    println!("valid alice proof: {ok}");
+
+    println!();
+    println!("=== fake proof test ===");
+    let fake_alice_account = Account::new_eoa(1, 999_999);
+
+    let fake_ok = AccountTrie::verify_account_proof(root, alice, &fake_alice_account, &proof);
+
+    println!("valid fake alice proof: {fake_ok}");
+    assert!(ok);
+    assert!(!fake_ok);
 }
