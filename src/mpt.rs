@@ -27,6 +27,16 @@ fn unpack_nibbles(bytes: &[u8]) -> Vec<Nibble> {
     nibbles
 }
 
+fn bytes_to_nibbles(bytes: &[u8]) -> Vec<Nibble> {
+    let mut nibbles = Vec::with_capacity(bytes.len()*2);
+
+    for byte in bytes {
+        nibbles.push(byte >> 4);
+        nibbles.push(byte & 0x0f);
+    }
+    nibbles
+}
+
 pub fn compact_encode(path: &[Nibble], is_leaf: bool) -> Vec<u8> {
     assert!(
         path.iter().all(|nibble| *nibble < 16),
@@ -247,9 +257,69 @@ impl MptNodeDb {
         self.nodes.is_empty()
     }
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct MptTrie {
+    db: MptNodeDb,
+    root: Option<Hash>,
+}
+
+impl MptTrie {
+    pub fn new() -> Self {
+        MptTrie { 
+            db: MptNodeDb::new(), 
+            root: None,
+        }
+    }
+
+    pub fn from_root(db: MptNodeDb, root: Hash) -> Self {
+        MptTrie { db, root: Some(root) }
+    }
+
+    pub fn root_hash(&self) -> Hash {
+        self.root.unwrap_or([0u8; 32])
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let nibbles = bytes_to_nibbles(key);
+        let mut current_hash = self.root?;
+        // let mut remaining_path: &[u8] = nibbles.as_ref();
+        // let mut remaining_path: &[u8] = &nibbles;
+        // 都是针对原Vec建立切片，一个只读视图窗口
+        let mut remaining_path= nibbles.as_slice();
+
+        loop {
+            let node = self.db.get(current_hash)?;
+
+            match node {
+                MptNode::Branch { children, value } => {
+                    if remaining_path.is_empty() {
+                        return value;
+                    }
+
+                    current_hash = children[remaining_path[0] as usize]?;
+                    remaining_path = &remaining_path[1..];
+                },
+                MptNode::Leaf { path, value } => {
+                    return (path == remaining_path).then_some(value);
+                },
+                MptNode::Extension { path, child } => {
+                    if !remaining_path.starts_with(&path) {
+                        return None;
+                    }
+
+                    current_hash = child;
+                    remaining_path = &remaining_path[path.len()..];
+                },
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::trie;
+
+use super::*;
 
     #[test]
     fn branch_starts_empty() {
@@ -515,5 +585,89 @@ mod tests {
         assert_eq!(db.get([0x99u8; 32]), None);
         assert_eq!(db.get_encoded([0x99u8; 32]), None);
         assert!(!db.contains([0x99u8; 32]));
+    }
+
+    #[test]
+    fn empty_mpt_trie_has_zero_root_and_no_values() {
+        let trie = MptTrie::new();
+
+        assert_eq!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.get(b"\x12"), None);
+    }
+
+    #[test]
+    fn mpt_get_reads_root_leaf_on_exact_path(){
+        let mut db = MptNodeDb::new();
+        let root = db.put(&MptNode::leaf(
+            vec![0x01, 0x02, 0x03, 0x04], 
+            b"value".to_vec()
+        ));
+
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.root_hash(), root);
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn mpt_get_rejects_root_leaf_path_mismatch() {
+        let mut db = MptNodeDb::new();
+        let root = db.put(&MptNode::leaf(
+            vec![0x01, 0x02, 0x03, 0x04],
+            b"value".to_vec(),
+        ));
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.get(b"\x12\x35"), None);
+        assert_eq!(trie.get(b"\x12"), None);
+    }
+
+    #[test]
+    fn mpt_get_walks_extension_to_leaf() {
+        let mut db = MptNodeDb::new();
+        let leaf = db.put(&MptNode::leaf(vec![0x03, 0x04], b"value".to_vec()));
+        let root = db.put(&MptNode::extension(vec![0x01, 0x02], leaf));
+
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn mpt_get_rejects_extension_path_mismatch() {
+        let mut db = MptNodeDb::new();
+        let leaf = db.put(&MptNode::leaf(vec![0x03, 0x04], b"value".to_vec()));
+        let root = db.put(&MptNode::extension(vec![0x01, 0x02], leaf));
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.get(b"\x13\x04"), None);
+        assert_eq!(trie.get(b"\x12"), None);
+    }
+
+    #[test]
+    fn mpt_get_walks_branch_child() {
+        let mut db = MptNodeDb::new();
+        let leaf = db.put(&MptNode::leaf(vec![0x02, 0x03, 0x00], b"value".to_vec()));
+        let mut children = [None; 16];
+        children[1] = Some(leaf);
+        let root = db.put(&MptNode::Branch { 
+            children,
+            value: None
+        });
+
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.get(b"\x12\x30"), Some(b"value".to_vec()));
+        assert_eq!(trie.get(b"\x22\x30"), None);
+    }
+
+    #[test]
+    fn mpt_get_reads_branch_value_when_key_ends_at_branch() {
+        let mut db = MptNodeDb::new();
+        let root = db.put(&MptNode::branch_with_value(b"branch-value".to_vec()));
+        let trie = MptTrie::from_root(db, root);
+
+        assert_eq!(trie.get(b""), Some(b"branch-value".to_vec()));
+        assert_eq!(trie.get(b"\x00"), None);
     }
 }

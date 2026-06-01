@@ -7,6 +7,7 @@ pub mod types;
 
 pub use account::{Account, AccountDecodeError, AccountTrie};
 pub use crypto::keccak256;
+pub use mpt::{MptNode, MptNodeDb, Nibble, NodeRef};
 pub use trie::{MerkleRadixTrie, verify_proof};
 pub use types::{Address, Hash};
 
