@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use rlp::{Rlp, RlpStream};
 
+use crate::crypto::keccak256;
 use crate::types::Hash;
 
 pub type Nibble = u8;
@@ -204,6 +206,47 @@ impl MptNode {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MptNodeDb {
+    nodes: HashMap<Hash, Vec<u8>>,
+}
+
+impl MptNodeDb {
+    pub fn new() -> Self {
+        Self { nodes: HashMap::new(), }
+    }
+
+    pub fn put(&mut self, node: &MptNode) -> Hash {
+        let encoded = node.encode();
+        let hash = keccak256(&encoded);
+
+        self.nodes.insert(hash, encoded);
+        
+        hash
+    }
+
+    pub fn get(&self, hash: Hash) -> Option<MptNode> {
+        let encoded = self.nodes.get(&hash)?;
+
+        MptNode::decode(encoded)
+    }
+
+    pub fn get_encoded(&self, hash: Hash) -> Option<&[u8]> {
+        self.nodes.get(&hash).map(Vec::as_slice)
+    }
+
+    pub fn contains(&self, hash: Hash) -> bool {
+        self.nodes.contains_key(&hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +462,58 @@ mod tests {
         stream.append(&b"value".to_vec());
 
         assert_eq!(MptNode::decode(&stream.out()), None);
+    }
+
+    #[test]
+    fn node_db_put_returns_hash_of_encoded_node() {
+        let mut db = MptNodeDb::new();
+        let node = MptNode::branch_with_value(b"branch-value".to_vec());
+
+        let hash = db.put(&node);
+
+        assert_eq!(hash, keccak256(&node.encode()));
+        assert!(db.contains(hash));
+    }
+
+    #[test]
+    fn node_db_get_decodes_stored_node() {
+        let mut db = MptNodeDb::new();
+        let node = MptNode::extension(vec![0x0a], [0x55u8; 32]);
+
+        let hash = db.put(&node);
+
+        assert_eq!(db.get(hash), Some(node));
+    }
+
+    #[test]
+    fn node_db_get_encoded_returns_raw_encoded_node() {
+        let mut db = MptNodeDb::new();
+        let node = MptNode::branch_with_value(b"branch-value".to_vec());
+        let encoded = node.encode();
+
+        let hash = db.put(&node);
+
+        assert_eq!(db.get_encoded(hash), Some(encoded.as_slice()));
+    }
+
+    #[test]
+    fn node_db_deduplicates_identical_nodes_by_hash() {
+        let mut db = MptNodeDb::new();
+        let node = MptNode::leaf(vec![0x01], b"value".to_vec());
+
+        let first_hash = db.put(&node);
+        let second_hash = db.put(&node);
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    fn node_db_returns_none_for_missing_hash() {
+        let db = MptNodeDb::new();
+
+        assert_eq!(db.get([0x99u8; 32]), None);
+        assert_eq!(db.get_encoded([0x99u8; 32]), None);
+        assert!(!db.contains([0x99u8; 32]));
     }
 }
