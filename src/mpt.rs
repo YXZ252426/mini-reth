@@ -37,6 +37,13 @@ fn bytes_to_nibbles(bytes: &[u8]) -> Vec<Nibble> {
     nibbles
 }
 
+fn common_prefix_len(left: &[Nibble], right: &[Nibble]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 pub fn compact_encode(path: &[Nibble], is_leaf: bool) -> Vec<u8> {
     assert!(
         path.iter().all(|nibble| *nibble < 16),
@@ -314,11 +321,168 @@ impl MptTrie {
             }
         }
     }
+
+    pub fn insert(&mut self, key: &[u8], value: Vec<u8>) {
+        let nibbles = bytes_to_nibbles(key);
+        let new_root = self.insert_at(self.root, &nibbles, value);
+
+        self.root = Some(new_root);
+    }
+
+    fn insert_at(&mut self, node_hash: Option<Hash>, path: &[Nibble], value: Vec<u8>) -> Hash {
+        let Some(node_hash) = node_hash else {
+            return self.db.put(&MptNode::leaf(path.to_vec(), value));
+        };
+
+        let node = self
+            .db
+            .get(node_hash)
+            .expect("stored MPT node should decode");
+
+        match node {
+            MptNode::Branch { 
+                mut children, 
+                value: branch_value 
+            } => self.insert_into_branch(&mut children, branch_value, path, value),
+            MptNode::Leaf { 
+                path: existing_path, 
+                value: existing_value,
+            } => self.insert_into_leaf(existing_path, existing_value, path, value),
+            MptNode::Extension { 
+                path: existing_path, 
+                child,
+            } => self.insert_into_extension(existing_path, child, path, value),
+        }
+    }
+
+    fn insert_into_branch(
+        &mut self, 
+        children: &mut [Option<NodeRef>; 16],
+        mut branch_value: Option<Vec<u8>>,
+        path: &[Nibble],
+        value: Vec<u8>,
+    ) -> Hash {
+        if path.is_empty() {
+            branch_value = Some(value);
+        } else {
+            let child_index = path[0] as usize;
+            let new_child = self.insert_at(children[child_index], &path[1..], value);
+            children[child_index] = Some(new_child);
+        }
+
+        self.db.put(&MptNode::Branch { 
+            children: *children, 
+            value: branch_value, 
+        })
+    }
+    fn insert_into_leaf(
+        &mut self,
+        existing_path: Vec<Nibble>,
+        existing_value: Vec<u8>,
+        new_path: &[Nibble],
+        new_value: Vec<u8>,
+    ) -> Hash {
+        let shared_len = common_prefix_len(&existing_path, new_path);
+
+        if shared_len == existing_path.len() && shared_len == new_path.len() {
+            return self.db.put(&MptNode::leaf(existing_path, new_value));
+        }
+
+        let branch_hash  = self.make_branch_from_two_paths(
+            &existing_path[shared_len..], 
+            existing_value, 
+            &new_path[shared_len..], 
+            new_value
+        );
+
+        self.wrap_shared_path(&existing_path[..shared_len], branch_hash)
+    }
+    fn insert_into_extension(
+        &mut self,
+        extension_path: Vec<Nibble>,
+        child: NodeRef,
+        new_path: &[Nibble],
+        new_value: Vec<u8>,
+    ) -> Hash {
+        let shared_len = common_prefix_len(&extension_path, new_path);
+
+        if shared_len == extension_path.len() {
+            let new_child = self.insert_at(Some(child), &new_path[shared_len..], new_value);
+            return self.db.put(&MptNode::extension(extension_path, new_child));
+        }
+
+        let mut children = [None; 16];
+        let mut branch_value = None;
+
+        let old_remaining = &extension_path[shared_len..];
+        let old_child_index = old_remaining[0] as usize;
+        children[old_child_index] = Some(if old_remaining.len() == 1 {
+            child
+        } else {
+            self.db
+                .put(&MptNode::extension(old_remaining[1..].to_vec(), child))
+        });
+
+        self.attach_value_to_branch(
+            &mut children, 
+            &mut branch_value, 
+            &new_path[shared_len..], 
+            new_value,
+        );
+
+        let branch_hash = self.db.put(&MptNode::Branch { 
+            children, 
+            value: branch_value,
+        });
+
+        self.wrap_shared_path(&extension_path[..shared_len], branch_hash)
+    }
+
+    fn make_branch_from_two_paths(
+        &mut self,
+        old_path: &[Nibble],
+        old_value: Vec<u8>,
+        new_path: &[Nibble],
+        new_value: Vec<u8>
+    ) -> Hash {
+        let mut children = [None; 16];
+        let mut branch_value = None;
+
+        self.attach_value_to_branch(&mut children, &mut branch_value, old_path, old_value);
+        self.attach_value_to_branch(&mut children, &mut branch_value, new_path, new_value);
+
+        self.db.put(&MptNode::Branch { 
+            children, 
+            value: branch_value,
+        })
+    }
+
+    fn attach_value_to_branch(
+        &mut self,
+        children: &mut [Option<NodeRef>; 16],
+        branch_value: &mut Option<Vec<u8>>,
+        path: &[Nibble],
+        value: Vec<u8>
+    ) {
+        if path.is_empty() {
+            *branch_value = Some(value);
+            return;
+        }
+
+        let child_index = path[0] as usize;
+        children[child_index] = Some(self.db.put(&MptNode::leaf(path[1..].to_vec(), value)));
+    }
+    fn wrap_shared_path(&mut self, shared_path: &[Nibble], child: NodeRef) -> Hash {
+        if shared_path.is_empty() {
+            child
+        } else {
+            self.db
+                .put(&MptNode::extension(shared_path.to_vec(), child))
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
-    use crate::trie;
-
 use super::*;
 
     #[test]
@@ -669,5 +833,109 @@ use super::*;
 
         assert_eq!(trie.get(b""), Some(b"branch-value".to_vec()));
         assert_eq!(trie.get(b"\x00"), None);
+    }
+
+    #[test]
+    fn mpt_insert_into_empty_trie_creates_readable_leaf() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12\x34", b"value".to_vec());
+
+        assert_ne!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"value".to_vec()));
+        assert_eq!(trie.get(b"\x12\x35"), None);
+    }
+
+    #[test]
+    fn mpt_insert_same_key_overwrites_value() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12", b"old".to_vec());
+        let old_root = trie.root_hash();
+        trie.insert(b"\x12", b"new".to_vec());
+
+        assert_ne!(trie.root_hash(), old_root);
+        assert_eq!(trie.get(b"\x12"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn mpt_insert_same_key_same_value_keeps_root_stable() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12", b"value".to_vec());
+        let first_root = trie.root_hash();
+        trie.insert(b"\x12", b"value".to_vec());
+
+        assert_eq!(trie.root_hash(), first_root);
+    }
+
+    #[test]
+    fn mpt_insert_two_keys_without_shared_prefix_creates_branch() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x10", b"left".to_vec());
+        trie.insert(b"\x20", b"right".to_vec());
+
+        assert_eq!(trie.get(b"\x10"), Some(b"left".to_vec()));
+        assert_eq!(trie.get(b"\x20"), Some(b"right".to_vec()));
+        assert_eq!(trie.get(b"\x30"), None);
+    }
+
+    #[test]
+    fn mpt_insert_two_keys_with_shared_prefix_creates_extension_and_branch() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12\x34", b"left".to_vec());
+        trie.insert(b"\x12\x35", b"right".to_vec());
+
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"left".to_vec()));
+        assert_eq!(trie.get(b"\x12\x35"), Some(b"right".to_vec()));
+        assert_eq!(trie.get(b"\x12\x36"), None);
+    }
+
+    #[test]
+    fn mpt_insert_short_key_after_long_key_uses_branch_value() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12\x34", b"long".to_vec());
+        trie.insert(b"\x12", b"short".to_vec());
+
+        assert_eq!(trie.get(b"\x12"), Some(b"short".to_vec()));
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"long".to_vec()));
+    }
+
+    #[test]
+    fn mpt_insert_long_key_after_short_key_preserves_branch_value() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12", b"short".to_vec());
+        trie.insert(b"\x12\x34", b"long".to_vec());
+
+        assert_eq!(trie.get(b"\x12"), Some(b"short".to_vec()));
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"long".to_vec()));
+    }
+
+    #[test]
+    fn mpt_insert_through_existing_extension_adds_branch_child() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"\x12\x34", b"first".to_vec());
+        trie.insert(b"\x12\x35", b"second".to_vec());
+        trie.insert(b"\x12\x36", b"third".to_vec());
+
+        assert_eq!(trie.get(b"\x12\x34"), Some(b"first".to_vec()));
+        assert_eq!(trie.get(b"\x12\x35"), Some(b"second".to_vec()));
+        assert_eq!(trie.get(b"\x12\x36"), Some(b"third".to_vec()));
+    }
+
+    #[test]
+    fn mpt_insert_empty_key_is_readable() {
+        let mut trie = MptTrie::new();
+
+        trie.insert(b"", b"empty-key".to_vec());
+        trie.insert(b"\x12", b"other".to_vec());
+
+        assert_eq!(trie.get(b""), Some(b"empty-key".to_vec()));
+        assert_eq!(trie.get(b"\x12"), Some(b"other".to_vec()));
     }
 }
