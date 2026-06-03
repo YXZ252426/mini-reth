@@ -71,6 +71,19 @@ mod tests {
     }
 
     #[test]
+    fn account_trie_uses_mpt_proof_shape() {
+        let (account_trie, alice, _) = sample_account_trie();
+        let proof = account_trie
+            .prove_account(alice)
+            .expect("alice proof should exist");
+
+        assert!(
+            proof.len() < 65,
+            "real MPT proof should be shorter than the old branch-only path"
+        );
+    }
+
+    #[test]
     fn proof_rejects_wrong_account_value() {
         let (account_trie, alice, _) = sample_account_trie();
         let root = account_trie.root_hash();

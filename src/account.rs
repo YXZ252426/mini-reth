@@ -1,7 +1,7 @@
 use rlp::{DecoderError, Rlp, RlpStream};
 
 use crate::crypto::keccak256;
-use crate::trie::{MerkleRadixTrie, verify_proof};
+use crate::mpt::{MptTrie, verify_mpt_proof};
 use crate::types::{Address, Hash};
 
 // A minimal Ethereum-like account payload stored as the trie value.
@@ -82,7 +82,7 @@ impl Account {
 
 #[derive(Debug, Clone)]
 pub struct AccountTrie {
-    trie: MerkleRadixTrie,
+    trie: MptTrie,
 }
 
 impl Default for AccountTrie {
@@ -94,7 +94,7 @@ impl Default for AccountTrie {
 impl AccountTrie {
     pub fn new() -> Self {
         AccountTrie {
-            trie: MerkleRadixTrie::new(),
+            trie: MptTrie::new(),
         }
     }
 
@@ -134,6 +134,6 @@ impl AccountTrie {
         let account_key = keccak256(&address);
         let encoded_account = account.encode();
 
-        verify_proof(root, &account_key, &encoded_account, proof)
+        verify_mpt_proof(root, &account_key, &encoded_account, proof)
     }
 }
