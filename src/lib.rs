@@ -10,7 +10,7 @@ pub use account::{Account, AccountDecodeError, AccountTrie};
 pub use crypto::keccak256;
 pub use mpt::{MptNode, MptNodeDb, MptTrie, Nibble, NodeRef, verify_mpt_proof};
 pub use storage::{
-    StorageKey, StorageValue, decode_storage_value, encode_storage_value, storage_trie_key,
+    StorageKey, StorageValue, StorageTrie, decode_storage_value, encode_storage_value, storage_trie_key,
 };
 pub use trie::{MerkleRadixTrie, verify_proof};
 pub use types::{Address, Hash};
