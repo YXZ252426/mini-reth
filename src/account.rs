@@ -2,6 +2,7 @@ use rlp::{DecoderError, Rlp, RlpStream};
 
 use crate::crypto::keccak256;
 use crate::mpt::{MptTrie, verify_mpt_proof};
+use crate::storage::{self, StorageTrie};
 use crate::types::{Address, Hash};
 
 // A minimal Ethereum-like account payload stored as the trie value.
@@ -21,16 +22,28 @@ pub enum AccountDecodeError {
 }
 
 impl Account {
+    pub fn empty_storage_root() -> Hash {
+        StorageTrie::new().root_hash()
+    }
     // Create a simple externally owned account with empty storage and code.
     pub fn new_eoa(nonce: u64, balance: u64) -> Self {
         Self {
             nonce,
             balance,
-            storage_root: [0; 32],
+            storage_root: Self::empty_storage_root(),
             code_hash: [0; 32],
         }
     }
 
+    // Create a contract account with caller-supplied storage and code roots.
+    pub fn new_contract(nonce: u64, balance: u64, storage_root: Hash, code_hash: Hash) -> Self{
+        Self { 
+            nonce, 
+            balance, 
+            storage_root, 
+            code_hash, 
+        }
+    }
     // Encode accounts as RLP so the stored bytes have a deterministic hash.
     pub fn encode(&self) -> Vec<u8> {
         let mut stream = RlpStream::new_list(4);
@@ -80,6 +93,44 @@ impl Account {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::account;
+
+use super::*;
+
+    #[test]
+    fn eoa_use_empty_storage_root() {
+        let account = Account::new_eoa(1, 100);
+
+        assert_eq!(account.storage_root, Account::empty_storage_root());
+        assert_eq!(account.storage_root, StorageTrie::new().root_hash());
+        assert_eq!(account.storage_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn contract_keeps_supplied_storage_and_code_roots() {
+        let storage_root = [0x11u8; 32];
+        let code_hash = [0x22u8; 32];
+
+        let account = Account::new_contract(7, 99, storage_root, code_hash);
+
+        assert_eq!(account.nonce, 7);
+        assert_eq!(account.balance, 99);
+        assert_eq!(account.storage_root, storage_root);
+        assert_eq!(account.code_hash, code_hash);
+    }
+
+    #[test]
+    fn contract_account_round_trips_through_rlp() {
+        let account = Account::new_contract(7, 99, [0x11u8; 32], [0x22u8; 32]);
+
+        let decoded = Account::try_decode(&account.encode()).expect("account should decode");
+
+        assert_eq!(account, decoded);
+    }
+
+}
 #[derive(Debug, Clone)]
 pub struct AccountTrie {
     trie: MptTrie,
