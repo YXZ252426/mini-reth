@@ -8,7 +8,7 @@ pub mod types;
 
 pub use account::{Account, AccountDecodeError, AccountTrie};
 pub use crypto::keccak256;
-pub use execution::State;
+pub use execution::{State, StateError};
 pub use mpt::{MptNode, MptNodeDb, MptTrie, Nibble, NodeRef, verify_mpt_proof};
 pub use storage::{
     StorageKey, StorageValue, StorageTrie, decode_storage_value, encode_storage_value, storage_trie_key,
