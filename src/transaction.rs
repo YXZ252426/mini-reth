@@ -2,6 +2,7 @@ use std::string::FromUtf8Error;
 
 use rlp::{DecoderError, Rlp, RlpStream};
 
+use crate::mpt::MptTrie;
 use crate::types::Address;
 
 
@@ -12,7 +13,33 @@ pub fn encode_ordered_trie_index(index: usize) -> Vec<u8> {
 
     stream.out().to_vec()
 }
-#[derive(Debug, PartialEq, Eq)]
+
+// Transaction tries are keyed by the RLP-encoded transaction index, not by a
+// hashed key. Unlike account/storage keys, transaction indexes are deterministic,
+// dense, and block-local, so Ethereum keeps their ordered position directly in
+// the trie key.
+pub fn transaction_root(transactions: &[Transaction]) -> crate::types::Hash {
+    let mut trie = MptTrie::new();
+
+    for (index, transaction) in transactions.iter().enumerate() {
+        let trie_key = encode_ordered_trie_index(index);
+        trie.insert(&trie_key, transaction.encode());
+    }
+
+    trie.root_hash()
+}
+
+pub fn receipt_root(receipts: &[Receipt]) -> crate::types::Hash {
+    let mut trie = MptTrie::new();
+
+    for (index, receipt) in receipts.iter().enumerate() {
+        let trie_key = encode_ordered_trie_index(index);
+        trie.insert(&trie_key, receipt.encode());
+    }
+
+    trie.root_hash()
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub from: Address,
     pub to: Address,
@@ -20,7 +47,7 @@ pub struct Transaction {
     pub value: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionDecodeError {
     InvalidRlp(DecoderError),
     InvalidFromLength(usize),
@@ -77,14 +104,14 @@ impl Transaction {
     
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
     pub success: bool,
     pub gas_used: u64,
     pub error: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptDecodeError {
     InvalidRlp(DecoderError),
     InvalidSuccessFlag(u8),
@@ -155,6 +182,16 @@ impl Receipt {
 mod tests {
     use super::*;
 
+    fn sample_transactions() -> Vec<Transaction> {
+        vec![
+            Transaction::new_transfer([0x11u8; 20], [0x22u8; 20], 0, 100),
+            Transaction::new_transfer([0x22u8; 20], [0x33u8; 20], 1, 200),
+        ]
+    }
+
+    fn sample_receipts() -> Vec<Receipt> {
+        vec![Receipt::success(21_000), Receipt::failure(21_000, "failed")]
+    }
     #[test]
     fn ordered_trie_index_encoding_is_deterministic() {
         assert_eq!(encode_ordered_trie_index(7), encode_ordered_trie_index(7));
@@ -254,5 +291,68 @@ mod tests {
             result,
             Err(ReceiptDecodeError::InvalidErrorUtf8(_))
         ));
+    }
+
+    #[test]
+    fn empty_transaction_root_matches_empty_mpt_root() {
+        assert_eq!(transaction_root(&[]), MptTrie::new().root_hash());
+    }
+
+    #[test]
+    fn transaction_root_is_deterministic_for_same_ordered_transactions() {
+        let transactions = sample_transactions();
+
+        assert_eq!(transaction_root(&transactions), transaction_root(&transactions));
+    }
+
+    #[test]
+    fn transaction_root_changes_when_transaction_changes() {
+        let transactions = sample_transactions();
+        let mut changed_transactions = transactions.clone();
+        changed_transactions[0].value += 1;
+
+        assert_ne!(transaction_root(&transactions), transaction_root(&changed_transactions))
+    }
+
+    #[test]
+    fn transaction_root_changes_when_order_changes() {
+        let transactions = sample_transactions();
+        let mut reordered_transactions = transactions.clone();
+        reordered_transactions.swap(0, 1);
+
+        assert_ne!(
+            transaction_root(&transactions),
+            transaction_root(&reordered_transactions)
+        );
+    }
+
+   #[test]
+    fn empty_receipt_root_matches_empty_mpt_root() {
+        assert_eq!(receipt_root(&[]), MptTrie::new().root_hash());
+    }
+
+    #[test]
+    fn receipt_root_is_deterministic_for_same_ordered_receipts() {
+        let receipts = sample_receipts();
+
+        assert_eq!(receipt_root(&receipts), receipt_root(&receipts));
+    }
+
+    #[test]
+    fn receipt_root_changes_when_receipt_changes() {
+        let receipts = sample_receipts();
+        let mut changed_receipts = receipts.clone();
+        changed_receipts[0] = Receipt::failure(21_000, "failed");
+
+        assert_ne!(receipt_root(&receipts), receipt_root(&changed_receipts));
+    }
+
+    #[test]
+    fn receipt_root_changes_when_order_changes() {
+        let receipts = sample_receipts();
+        let mut reordered_receipts = receipts.clone();
+        reordered_receipts.swap(0, 1);
+
+        assert_ne!(receipt_root(&receipts), receipt_root(&reordered_receipts));
     }
 }

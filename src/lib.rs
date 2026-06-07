@@ -14,7 +14,8 @@ pub use mpt::{MptNode, MptNodeDb, MptTrie, Nibble, NodeRef, verify_mpt_proof};
 pub use storage::{
     StorageKey, StorageValue, StorageTrie, decode_storage_value, encode_storage_value, storage_trie_key,
 };
-pub use transaction::{Transaction, TransactionDecodeError, Receipt, ReceiptDecodeError, encode_ordered_trie_index};
+pub use transaction::{Transaction, TransactionDecodeError, Receipt, ReceiptDecodeError, 
+        encode_ordered_trie_index, transaction_root, receipt_root};
 pub use trie::{MerkleRadixTrie, verify_proof};
 pub use types::{Address, Hash};
 
