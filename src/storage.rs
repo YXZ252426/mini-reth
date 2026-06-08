@@ -1,6 +1,8 @@
 use rlp::{Rlp, RlpStream};
 
-use crate::{Hash, MptTrie, keccak256, verify_mpt_proof};
+use crate::crypto::keccak256;
+use crate::mpt::{MptNodeDb, MptTrie, verify_mpt_proof};
+use crate::types::Hash;
 
 pub type StorageKey = [u8; 32];
 pub type StorageValue = Vec<u8>;
@@ -31,6 +33,16 @@ impl StorageTrie {
         }
     }
     
+    pub fn from_root(db: MptNodeDb, root: Hash) -> Self {
+        Self {
+            trie: MptTrie::from_root(db, root),
+        }
+    }
+
+    pub fn into_parts(self) -> (MptNodeDb, Option<Hash>) {
+        self.trie.into_parts()
+    }
+
     pub fn root_hash(&self) -> Hash {
         self.trie.root_hash()
     }
@@ -195,5 +207,25 @@ mod tests {
         trie.set_slot([0x11u8; 32], b"value".to_vec());
 
         assert_eq!(trie.prove_slot([0x22u8; 32]), None);
+    }
+
+    #[test]
+    fn storage_trie_reopens_from_saved_root_and_database() {
+        let mut trie = StorageTrie::new();
+        let first_key = [0x11u8; 32];
+        let second_key = [0x22u8; 32];
+
+        trie.set_slot(first_key, b"first".to_vec());
+        trie.set_slot(second_key, b"second".to_vec());
+        let root = trie.root_hash();
+        let (db, saved_root) = trie.into_parts();
+
+        let reopened = StorageTrie::from_root(db, root);
+
+        assert_eq!(saved_root, Some(root));
+        assert_eq!(reopened.root_hash(), root);
+        assert_eq!(reopened.get_slot(first_key), Some(b"first".to_vec()));
+        assert_eq!(reopened.get_slot(second_key), Some(b"second".to_vec()));
+        assert_eq!(reopened.get_slot([0x33u8; 32]), None);
     }
 }

@@ -1,8 +1,8 @@
 use rlp::{DecoderError, Rlp, RlpStream};
 
 use crate::crypto::keccak256;
-use crate::mpt::{MptTrie, verify_mpt_proof};
-use crate::storage::{self, StorageTrie};
+use crate::mpt::{MptNodeDb, MptTrie, verify_mpt_proof};
+use crate::storage::StorageTrie;
 use crate::types::{Address, Hash};
 
 // A minimal Ethereum-like account payload stored as the trie value.
@@ -95,8 +95,6 @@ impl Account {
 
 #[cfg(test)]
 mod tests {
-    use crate::account;
-
 use super::*;
 
     #[test]
@@ -130,6 +128,27 @@ use super::*;
         assert_eq!(account, decoded);
     }
 
+    #[test]
+    fn account_trie_reopen_from_saved_root_and_database() {
+        let mut trie = AccountTrie::new();
+        let alice= [0x11u8; 20];
+        let bob = [0x22u8; 20];
+        let alice_account= Account::new_eoa(1, 100);
+        let bob_account = Account::new_eoa(2, 200);
+        
+        trie.insert_account(alice, alice_account.clone());
+        trie.insert_account(bob, bob_account.clone());
+        let root = trie.root_hash();
+        let (db, saved_root) = trie.into_parts();
+
+        let reopened = AccountTrie::from_root(db, root);
+
+        assert_eq!(saved_root, Some(root));
+        assert_eq!(reopened.root_hash(), root);
+        assert_eq!(reopened.get_account(alice), Some(alice_account));
+        assert_eq!(reopened.get_account(bob), Some(bob_account));
+        assert_eq!(reopened.get_account([0x33u8; 20]), None);
+    }
 }
 #[derive(Debug, Clone)]
 pub struct AccountTrie {
@@ -149,6 +168,13 @@ impl AccountTrie {
         }
     }
 
+    pub fn from_root(db: MptNodeDb, root: Hash) -> Self {
+        Self { trie: MptTrie::from_root(db, root) }
+    }
+
+    pub fn into_parts(self) -> (MptNodeDb, Option<Hash>) {
+        self.trie.into_parts()
+    }
     pub fn root_hash(&self) -> Hash {
         self.trie.root_hash()
     }
