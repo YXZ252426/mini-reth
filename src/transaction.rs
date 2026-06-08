@@ -18,7 +18,7 @@ pub fn encode_ordered_trie_index(index: usize) -> Vec<u8> {
 // hashed key. Unlike account/storage keys, transaction indexes are deterministic,
 // dense, and block-local, so Ethereum keeps their ordered position directly in
 // the trie key.
-pub fn transaction_root(transactions: &[Transaction]) -> crate::types::Hash {
+pub fn build_transaction_trie(transactions: &[Transaction]) -> MptTrie {
     let mut trie = MptTrie::new();
 
     for (index, transaction) in transactions.iter().enumerate() {
@@ -26,10 +26,14 @@ pub fn transaction_root(transactions: &[Transaction]) -> crate::types::Hash {
         trie.insert(&trie_key, transaction.encode());
     }
 
-    trie.root_hash()
+    trie
 }
 
-pub fn receipt_root(receipts: &[Receipt]) -> crate::types::Hash {
+pub fn transaction_root(transactions: &[Transaction]) -> crate::types::Hash {
+    build_transaction_trie(transactions).root_hash()
+}
+
+pub fn build_receipt_trie(receipts: &[Receipt]) -> MptTrie {
     let mut trie = MptTrie::new();
 
     for (index, receipt) in receipts.iter().enumerate() {
@@ -37,8 +41,13 @@ pub fn receipt_root(receipts: &[Receipt]) -> crate::types::Hash {
         trie.insert(&trie_key, receipt.encode());
     }
 
-    trie.root_hash()
+    trie
 }
+
+pub fn receipt_root(receipts: &[Receipt]) -> crate::types::Hash {
+    build_receipt_trie(receipts).root_hash()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub from: Address,
@@ -326,6 +335,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transaction_trie_reopens_from_saved_root_and_database() {
+        let transactions = sample_transactions();
+        let trie = build_transaction_trie(&transactions);
+        let root = trie.root_hash();
+        let (db, saved_root) = trie.into_parts();
+
+        let reopened = MptTrie::from_root(db, root);
+        let encoded_transaction = reopened
+            .get(&encode_ordered_trie_index(1))
+            .expect("transaction should exist");
+
+        assert_eq!(saved_root, Some(root));
+        assert_eq!(reopened.root(), Some(root));
+        assert_eq!(
+            Transaction::try_decode(&encoded_transaction),
+            Ok(transactions[1].clone())
+        );
+        assert_eq!(reopened.get(&encode_ordered_trie_index(2)), None);
+    }
    #[test]
     fn empty_receipt_root_matches_empty_mpt_root() {
         assert_eq!(receipt_root(&[]), MptTrie::new().root_hash());
@@ -354,5 +383,26 @@ mod tests {
         reordered_receipts.swap(0, 1);
 
         assert_ne!(receipt_root(&receipts), receipt_root(&reordered_receipts));
+    }
+
+    #[test]
+    fn receipt_trie_reopens_from_saved_root_and_database() {
+        let receipts = sample_receipts();
+        let trie = build_receipt_trie(&receipts);
+        let root = trie.root_hash();
+        let (db, saved_root) = trie.into_parts();
+
+        let reopened = MptTrie::from_root(db, root);
+        let encoded_receipt = reopened
+            .get(&encode_ordered_trie_index(1))
+            .expect("receipt should exist");
+
+        assert_eq!(saved_root, Some(root));
+        assert_eq!(reopened.root(), Some(root));
+        assert_eq!(
+            Receipt::try_decode(&encoded_receipt),
+            Ok(receipts[1].clone())
+        );
+        assert_eq!(reopened.get(&encode_ordered_trie_index(2)), None);
     }
 }
