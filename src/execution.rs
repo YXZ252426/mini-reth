@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use crate::storage::{StorageKey, StorageTrie, StorageValue};
 use crate::account::{Account, AccountTrie};
+use crate::mpt::MptNodeDb;
+use crate::storage::{StorageKey, StorageTrie, StorageValue};
 use crate::types::{Address, Hash};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,18 @@ impl State {
             storage_tries: HashMap::new(),
         }
     }
+
+    pub fn from_account_root(db: MptNodeDb, root: Hash) -> Self {
+        Self {
+            accounts: AccountTrie::from_root(db, root),
+            storage_tries: HashMap::new(),
+        }
+    }
+
+    pub fn into_account_parts(self) -> (MptNodeDb, Option<Hash>) {
+        self.accounts.into_parts()
+    }
+
     pub fn root_hash(&self) -> Hash {
         self.accounts.root_hash()
     }
@@ -125,6 +138,28 @@ use super::*;
         assert_eq!(state.get_account(address), Some(account));
     }
 
+    #[test]
+    fn state_reopens_accounts_from_saved_root_and_database() {
+        let mut state = State::new();
+        let alice = [0x11u8; 20];
+        let bob = [0x22u8; 20];
+        let alice_account = Account::new_eoa(1, 100);
+        let bob_account = Account::new_eoa(2, 200);
+
+        state.create_account(alice, alice_account.clone());
+        state.create_account(bob, bob_account.clone());
+        let root = state.root_hash();
+        let (db, saved_root) = state.into_account_parts();
+
+        let reopened = State::from_account_root(db, root);
+
+        assert_eq!(saved_root, Some(root));
+        assert_eq!(reopened.root_hash(), root);
+        assert_eq!(reopened.get_account(alice), Some(alice_account));
+        assert_eq!(reopened.get_account(bob), Some(bob_account));
+        assert_eq!(reopened.get_account([0x33u8; 20]), None);
+    }
+    
     #[test]
     fn updating_account_changes_state_root() {
         let mut state = State::new();
