@@ -6,6 +6,7 @@ use crate::account::{Account, AccountTrie};
 use crate::crypto::keccak256;
 use crate::mpt::MptNodeDb;
 use crate::storage::{StorageKey, StorageTrie, StorageValue};
+use crate::transaction::{self, Transaction, TransactionDecodeError};
 use crate::types::{Address, Hash};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,74 @@ fn decode_hash (
     hash.copy_from_slice(&bytes);
     
     Ok(hash)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    pub header: Header,
+    pub transactions: Vec<Transaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockDecodeError {
+    InvalidRlp(DecoderError),
+    InvalidHeader(HeaderDecodeError),
+    InvalidTransaction {
+        index: usize,
+        error: TransactionDecodeError,
+    },
+}
+
+impl Block {
+    pub fn new(header: Header, transactions: Vec<Transaction>) -> Self {
+        Self {
+            header,
+            transactions,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut stream = RlpStream::new_list(2);
+
+        stream.append(&self.header.encode());
+        stream.begin_list(self.transactions.len());
+        for transaction in &self.transactions {
+            stream.append(&transaction.encode());
+        }
+
+        stream.out().to_vec()
+    }
+
+    pub fn hash(&self) -> Hash {
+        keccak256(&self.encode())
+    }
+
+    pub fn try_decode(bytes: &[u8]) -> Result<Self, BlockDecodeError> {
+        let rlp = Rlp::new(bytes);
+
+        let encoded_header: Vec<u8> = rlp.val_at(0).map_err(BlockDecodeError::InvalidRlp)?;
+        let header = 
+            Header::try_decode(&encoded_header).map_err(BlockDecodeError::InvalidHeader)?;
+        let transactions_rlp = rlp.at(1).map_err(BlockDecodeError::InvalidRlp)?;
+        let transaction_count = transactions_rlp
+            .item_count()
+            .map_err(BlockDecodeError::InvalidRlp)?;
+        let mut transactions = Vec::with_capacity(transaction_count);
+
+        for index in 0..transaction_count {
+            let encoded_transaction: Vec<u8> = transactions_rlp
+                .val_at(index)
+                .map_err(BlockDecodeError::InvalidRlp)?;
+            let transaction = Transaction::try_decode(&encoded_transaction)
+                .map_err(|error| BlockDecodeError::InvalidTransaction { index, error })?;
+            transactions.push(transaction);
+        }
+
+        Ok(Self { 
+            header, 
+            transactions 
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateError {
@@ -230,6 +299,17 @@ use super::*;
         )
     }
 
+    fn sample_transactions() -> Vec<Transaction> {
+        vec![
+            Transaction::new_transfer([0x11u8; 20], [0x22u8; 20], 0, 100),
+            Transaction::new_transfer([0x22u8; 20], [0x33u8; 20], 1, 200),
+        ]
+    }
+
+    fn sample_block() -> Block {
+        Block::new(sample_header(), sample_transactions())
+    }
+
     #[test]
     fn header_rlp_round_trips() {
         let header = sample_header();
@@ -271,6 +351,58 @@ use super::*;
         assert_eq!(result, Err(HeaderDecodeError::InvalidStateRootLength(31)));
     }
 
+    #[test]
+    fn block_rlp_round_trips() {
+        let block = sample_block();
+
+        let decoded = Block::try_decode(&block.encode()).expect("block should decode");
+
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn block_hash_is_deterministic() {
+        let block = sample_block();
+
+        assert_eq!(block.hash(), block.hash());
+        assert_eq!(block.hash(), keccak256(&block.encode()));
+    }
+
+    #[test]
+    fn block_hash_changes_when_transaction_changes() {
+        let block = sample_block();
+        let mut changed_block = block.clone();
+        changed_block.transactions[0].value += 1;
+
+        assert_ne!(block.hash(), changed_block.hash());
+    }
+
+    #[test]
+    fn block_decode_reports_invalid_transaction_index() {
+        let mut invalid_transaciton = RlpStream::new_list(4);
+        invalid_transaciton.append(&vec![0x11u8; 19]);
+        invalid_transaciton.append(&vec![0x22u8; 20]);
+        invalid_transaciton.append(&0u64);
+        invalid_transaciton.append(&100u64);
+
+        let mut transaction_list = RlpStream::new_list(1);
+        transaction_list.append(&invalid_transaciton.out().to_vec());
+
+        let mut block_stream = RlpStream::new_list(2);
+        block_stream.append(&sample_header().encode());
+        block_stream.append_raw(&transaction_list.out(), 1);
+
+        let result = Block::try_decode(&block_stream.out());
+
+        assert_eq!(
+            result,
+            Err(BlockDecodeError::InvalidTransaction { 
+                index: 0, 
+                error: TransactionDecodeError::InvalidFromLength(19) 
+            })
+        );
+    }
+    
     #[test]
     fn empty_state_has_empty_account_root() {
         let state = State::new();
