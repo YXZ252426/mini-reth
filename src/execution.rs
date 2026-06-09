@@ -10,6 +10,8 @@ use crate::storage::{StorageKey, StorageTrie, StorageValue};
 use crate::transaction::{Transaction, TransactionDecodeError, transaction_root, receipt_root};
 use crate::types::{Address, Hash};
 
+const SIMPLE_TRANSFER_GAS_USED: u64 = 21_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub parent_hash: Hash,
@@ -232,6 +234,15 @@ pub enum ExecutionError {
         balance: u64,
         required: u64,
     },
+    BalanceOverflow {
+        address: Address,
+        balance: u64,
+        amount: u64,
+    },
+    NonceOverflow {
+        address: Address,
+        nonce: u64,
+    },
     State(StateError),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +354,64 @@ impl State {
             _ => {self.storage_tries.remove(&address);}
         }
     }
+
+    pub fn apply_transaction(
+        &mut self,
+        transaction: &Transaction
+    ) -> Result<Receipt, ExecutionError> {
+        let mut sender = self
+            .get_account(transaction.from)
+            .ok_or(ExecutionError::MissingSender(transaction.from))?;
+        let mut recipient = self
+            .get_account(transaction.to)
+            .ok_or(ExecutionError::MissingRecipient(transaction.to))?;
+
+        if sender.nonce != transaction.nonce {
+            return Err(ExecutionError::InvalidNonce { 
+                address: transaction.from, 
+                expected: sender.nonce, 
+                actual: transaction.nonce, 
+            })
+        }
+
+        if sender.balance < transaction.value {
+            return Err(ExecutionError::InsufficientBalance { 
+                address: transaction.from, 
+                balance: sender.balance, 
+                required: transaction.value, 
+            })
+        }
+
+        sender.nonce = sender
+            .nonce
+            .checked_add(1)
+            .ok_or(ExecutionError::NonceOverflow { 
+                address: transaction.from, 
+                nonce: sender.nonce, 
+            })?;
+
+        if transaction.from == transaction.to {
+            self.update_account(transaction.from, sender);
+
+            return Ok(Receipt::success(SIMPLE_TRANSFER_GAS_USED));
+        }
+
+        recipient.balance = recipient.balance.checked_add(transaction.value).ok_or(
+            ExecutionError::BalanceOverflow { 
+                address: transaction.to, 
+                balance: recipient.balance, 
+                amount: transaction.value, 
+            }
+        )?;
+
+        sender.balance -= transaction.value;
+
+
+        self.update_account(transaction.from, sender);
+        self.update_account(transaction.to, recipient);
+
+        Ok(Receipt::success(SIMPLE_TRANSFER_GAS_USED))
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +442,17 @@ use super::*;
 
     fn sample_receipts() -> Vec<Receipt> {
         vec![Receipt::success(21_000), Receipt::failure(21_000, "failed")]
+    }
+
+    fn sample_state_with_accounts() -> (State, Address, Address) {
+        let mut state = State::new();
+        let alice = [0x11u8; 20];
+        let bob = [0x22u8; 20];
+
+        state.create_account(alice, Account::new_eoa(0, 1_000));
+        state.create_account(bob, Account::new_eoa(7, 50));
+
+        (state, alice, bob)
     }
 
     #[test]
@@ -749,5 +829,171 @@ use super::*;
         let result = state.set_storage_slot(address, slot_key, b"value".to_vec());
 
         assert_eq!(result, Err(StateError::StorageTrieUnavailable(address)));
+    }
+
+    #[test]
+    fn apply_transaction_transfer_balance_and_increments_sender_nonce() {
+        let (mut state, alice, bob)= sample_state_with_accounts();
+        let old_root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, bob, 0, 150);
+
+        let receipt = state
+            .apply_transaction(&transaction)
+            .expect("transfer should apply");
+
+        let alice_account = state.get_account(alice).unwrap();
+        let bob_account = state.get_account(bob).unwrap();
+
+        assert_eq!(receipt, Receipt::success(SIMPLE_TRANSFER_GAS_USED));
+        assert_eq!(alice_account.nonce, 1);
+        assert_eq!(alice_account.balance, 850);
+        assert_eq!(bob_account.nonce, 7);
+        assert_eq!(bob_account.balance, 200);
+        assert_ne!(old_root, state.root_hash());
+    }
+
+ #[test]
+    fn apply_transaction_self_transfer_only_increments_nonce() {
+        let (mut state, alice, _) = sample_state_with_accounts();
+        let old_root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, alice, 0, 150);
+
+        let receipt = state
+            .apply_transaction(&transaction)
+            .expect("self transfer should apply");
+
+        let alice_account = state.get_account(alice).unwrap();
+
+        assert_eq!(receipt, Receipt::success(SIMPLE_TRANSFER_GAS_USED));
+        assert_eq!(alice_account.nonce, 1);
+        assert_eq!(alice_account.balance, 1_000);
+        assert_ne!(state.root_hash(), old_root);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_missing_sender_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let missing_sender = [0x33u8; 20];
+        let transaction = Transaction::new_transfer(missing_sender, bob, 0, 150);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(result, Err(ExecutionError::MissingSender(missing_sender)));
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_missing_recipient_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let missing_recipient = [0x33u8; 20];
+        let transaction = Transaction::new_transfer(alice, missing_recipient, 0, 150);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::MissingRecipient(missing_recipient))
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_invalid_nonce_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, bob, 1, 150);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::InvalidNonce {
+                address: alice,
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_insufficient_balance_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, bob, 0, 1_001);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::InsufficientBalance {
+                address: alice,
+                balance: 1_000,
+                required: 1_001,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_recipient_balance_overflow_without_changing_state() {
+        let mut state = State::new();
+        let alice = [0x11u8; 20];
+        let bob = [0x22u8; 20];
+
+        state.create_account(alice, Account::new_eoa(0, 100));
+        state.create_account(bob, Account::new_eoa(7, u64::MAX));
+        let root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, bob, 0, 1);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::BalanceOverflow {
+                address: bob,
+                balance: u64::MAX,
+                amount: 1,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 100);
+        assert_eq!(state.get_account(bob).unwrap().balance, u64::MAX);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_sender_nonce_overflow_without_changing_state() {
+        let mut state = State::new();
+        let alice = [0x11u8; 20];
+        let bob = [0x22u8; 20];
+
+        state.create_account(alice, Account::new_eoa(u64::MAX, 100));
+        state.create_account(bob, Account::new_eoa(7, 50));
+        let root = state.root_hash();
+        let transaction = Transaction::new_transfer(alice, bob, u64::MAX, 1);
+
+        let result = state.apply_transaction(&transaction);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::NonceOverflow {
+                address: alice,
+                nonce: u64::MAX,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().nonce, u64::MAX);
+        assert_eq!(state.get_account(alice).unwrap().balance, 100);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
     }
 }
