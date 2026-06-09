@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use rlp::{DecoderError, Rlp, RlpStream};
 
+use crate::Receipt;
 use crate::account::{Account, AccountTrie};
 use crate::crypto::keccak256;
 use crate::mpt::MptNodeDb;
 use crate::storage::{StorageKey, StorageTrie, StorageValue};
-use crate::transaction::{self, Transaction, TransactionDecodeError};
+use crate::transaction::{Transaction, TransactionDecodeError, transaction_root, receipt_root};
 use crate::types::{Address, Hash};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +174,48 @@ impl Block {
         })
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub post_state_root: Hash,
+    pub receipts: Vec<Receipt>,
+    pub transactions_root: Hash,
+    pub receipts_root: Hash,
+}
+
+impl ExecutionResult {
+    pub fn new(
+        post_state_root: Hash,
+        transactions: &[Transaction],
+        receipts: Vec<Receipt>,
+    ) -> Self {
+        let transactions_root = transaction_root(transactions);
+        let receipts_root = receipt_root(&receipts);
+        Self { 
+            post_state_root, 
+            receipts, 
+            transactions_root, 
+            receipts_root, 
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionError {
+    MissingSender(Address),
+    MissingRecipient(Address),
+    InvalidNonce {
+        address: Address,
+        expected: u64,
+        actual: u64,
+    },
+    InsufficientBalance {
+        address: Address,
+        balance: u64,
+        required: u64,
+    },
+    State(StateError),
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateError {
     AccountNotFound(Address),
@@ -310,6 +353,10 @@ use super::*;
         Block::new(sample_header(), sample_transactions())
     }
 
+    fn sample_receipts() -> Vec<Receipt> {
+        vec![Receipt::success(21_000), Receipt::failure(21_000, "failed")]
+    }
+
     #[test]
     fn header_rlp_round_trips() {
         let header = sample_header();
@@ -403,6 +450,54 @@ use super::*;
         );
     }
     
+    #[test]
+    fn execution_result_derives_transaction_and_receipt_roots() {
+        let transactions = sample_transactions();
+        let receipts = sample_receipts();
+        let post_state_root = [0x55u8; 32];
+
+        let result = ExecutionResult::new(post_state_root, &transactions, receipts.clone());
+
+        assert_eq!(result.post_state_root, post_state_root);
+        assert_eq!(result.receipts, receipts);
+        assert_eq!(result.transactions_root, transaction_root(&transactions));
+        assert_eq!(result.receipts_root, receipt_root(&result.receipts));
+    }
+
+    #[test]
+    fn execution_result_roots_change_when_inputs_change() {
+        let transactions = sample_transactions();
+        let mut changed_transactions = transactions.clone();
+        changed_transactions[0].value += 1;
+        let receipts = sample_receipts();
+
+        let result = ExecutionResult::new([0x55u8; 32], &transactions, receipts.clone());
+        let changed_result = ExecutionResult::new([0x55u8; 32], &changed_transactions, receipts);
+
+        assert_ne!(result.transactions_root, changed_result.transactions_root);
+        assert_eq!(result.receipts_root, changed_result.receipts_root);
+    }
+
+    #[test]
+    fn execution_error_carries_context() {
+        let address = [0x11u8; 20];
+
+        let error = ExecutionError::InvalidNonce {
+            address,
+            expected: 7,
+            actual: 6,
+        };
+
+        assert_eq!(
+            error,
+            ExecutionError::InvalidNonce {
+                address,
+                expected: 7,
+                actual: 6,
+            }
+        );
+    }
+
     #[test]
     fn empty_state_has_empty_account_root() {
         let state = State::new();
