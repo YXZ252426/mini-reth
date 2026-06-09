@@ -107,6 +107,24 @@ fn decode_hash (
     Ok(hash)
 }
 
+pub fn build_header(
+    parent_hash: Hash,
+    number: u64,
+    state_root: Hash,
+    transactions: &[Transaction],
+    receipts: &[Receipt],
+    timestamp: u64,
+) -> Header {
+    Header::new(
+        parent_hash, 
+        number, 
+        state_root, 
+        transaction_root(transactions), 
+        receipt_root(receipts), 
+        timestamp,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: Header,
@@ -396,6 +414,59 @@ use super::*;
         let result = Header::try_decode(&stream.out());
 
         assert_eq!(result, Err(HeaderDecodeError::InvalidStateRootLength(31)));
+    }
+
+    #[test]
+    fn build_header_derives_roots_from_inputs() {
+        let parent_hash = [0x11u8; 32];
+        let state_root = [0x22u8; 32];
+        let transactions = sample_transactions();
+        let receipts = sample_receipts();
+
+        let header = build_header(
+            parent_hash,
+            7,
+            state_root,
+            &transactions,
+            &receipts,
+            1_700_000_000,
+        );
+
+        assert_eq!(header.parent_hash, parent_hash);
+        assert_eq!(header.number, 7);
+        assert_eq!(header.state_root, state_root);
+        assert_eq!(header.transactions_root, transaction_root(&transactions));
+        assert_eq!(header.receipts_root, receipt_root(&receipts));
+        assert_eq!(header.timestamp, 1_700_000_000);
+    }
+
+    #[test]
+    fn build_header_hash_changes_when_derived_roots_change() {
+        let transactions = sample_transactions();
+        let mut changed_transactions = transactions.clone();
+        changed_transactions[0].value += 1;
+        let receipts = sample_receipts();
+
+        let header = build_header(
+            [0x11u8; 32],
+            7,
+            [0x22u8; 32],
+            &transactions,
+            &receipts,
+            1_700_000_000,
+        );
+        let changed_header = build_header(
+            [0x11u8; 32],
+            7,
+            [0x22u8; 32],
+            &changed_transactions,
+            &receipts,
+            1_700_000_000,
+        );
+
+        assert_ne!(header.transactions_root, changed_header.transactions_root);
+        assert_eq!(header.receipts_root, changed_header.receipts_root);
+        assert_ne!(header.hash(), changed_header.hash());
     }
 
     #[test]
