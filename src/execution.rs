@@ -243,11 +243,23 @@ pub enum ExecutionError {
         address: Address,
         nonce: u64,
     },
-    State(StateError),
+    HeaderTransactionsRootMismatch {
+        expected: Hash,
+        actual: Hash
+    },
+    HeaderReceiptsRootMismatch {
+        expected: Hash,
+        actual: Hash,
+    },
+    HeaderStateRootMismatch {
+        expected: Hash,
+        actual: Hash,
+    },
     TransactionFailed {
         index: usize,
         error: Box<ExecutionError>,
-    }
+    },
+    State(StateError),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateError {
@@ -434,6 +446,38 @@ impl State {
             receipts.push(receipt);
         }
         let result = ExecutionResult::new(working_state.root_hash(), transactions, receipts);
+        *self = working_state;
+
+        Ok(result)
+    }
+
+    pub fn process_block(&mut self, block: &Block) -> Result<ExecutionResult, ExecutionError> {
+        let transaction_root = transaction_root(&block.transactions);
+
+        if transaction_root != block.header.transactions_root {
+            return Err(ExecutionError::HeaderTransactionsRootMismatch { 
+                expected: block.header.transactions_root, 
+                actual: transaction_root 
+            });
+        }
+
+        let mut working_state = self.clone();
+        let result = working_state.apply_transactions(&block.transactions)?;
+
+        if block.header.receipts_root != result.receipts_root {
+            return Err(ExecutionError::HeaderReceiptsRootMismatch { 
+                expected: block.header.receipts_root, 
+                actual: result.receipts_root 
+            });
+        }
+
+        if block.header.state_root != result.post_state_root {
+            return Err(ExecutionError::HeaderStateRootMismatch { 
+                expected: block.header.state_root, 
+                actual: result.post_state_root 
+            });
+        }
+
         *self = working_state;
 
         Ok(result)
@@ -1091,6 +1135,132 @@ use super::*;
         );
         assert_eq!(state.root_hash(), root);
         assert_eq!(state.get_account(alice).unwrap().nonce, 0);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn process_block_applies_transactions_and_validates_header_roots() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let transactions = vec![
+            Transaction::new_transfer(alice, bob, 0, 100),
+            Transaction::new_transfer(alice, bob, 1, 50),
+        ];
+        let mut expected_state = state.clone();
+        let expected_result = expected_state.apply_transactions(&transactions).unwrap();
+
+        let header = build_header(
+            [0x99u8; 32], 
+            1, 
+            expected_result.post_state_root, 
+            &transactions, 
+            &expected_result.receipts, 
+            1_700_000_001,
+        );
+
+        let block = Block::new(header, transactions);
+
+        let result = state.process_block(&block).expect("block should process");
+
+        assert_eq!(result, expected_result);
+        assert_eq!(state.root_hash(), expected_state.root_hash());
+        assert_eq!(state.get_account(alice).unwrap().nonce, 2);
+        assert_eq!(state.get_account(alice).unwrap().balance, 850);
+        assert_eq!(state.get_account(bob).unwrap().balance, 200);
+    }
+
+    #[test]
+    fn process_block_rejects_transaction_root_mismatch_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let transactions = vec![Transaction::new_transfer(alice, bob, 0, 100)];
+        let receipts = vec![Receipt::success(SIMPLE_TRANSFER_GAS_USED)];
+        let header = Header::new(
+            [0x99u8; 32],
+            1,
+            [0x55u8; 32],
+            [0x44u8; 32],
+            receipt_root(&receipts),
+            1_700_000_001,
+        );
+        let block = Block::new(header, transactions.clone());
+
+        let result = state.process_block(&block);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::HeaderTransactionsRootMismatch {
+                expected: [0x44u8; 32],
+                actual: transaction_root(&transactions),
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn process_block_rejects_receipt_root_mismatch_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let transactions = vec![Transaction::new_transfer(alice, bob, 0, 100)];
+        let mut expected_state = state.clone();
+        let expected_result = expected_state
+            .apply_transactions(&transactions)
+            .expect("transactions should apply");
+        let header = Header::new(
+            [0x99u8; 32],
+            1,
+            expected_result.post_state_root,
+            transaction_root(&transactions),
+            [0x44u8; 32],
+            1_700_000_001,
+        );
+        let block = Block::new(header, transactions);
+
+        let result = state.process_block(&block);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::HeaderReceiptsRootMismatch {
+                expected: [0x44u8; 32],
+                actual: expected_result.receipts_root,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
+        assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(bob).unwrap().balance, 50);
+    }
+
+    #[test]
+    fn process_block_rejects_state_root_mismatch_without_changing_state() {
+        let (mut state, alice, bob) = sample_state_with_accounts();
+        let root = state.root_hash();
+        let transactions = vec![Transaction::new_transfer(alice, bob, 0, 100)];
+        let mut expected_state = state.clone();
+        let expected_result = expected_state
+            .apply_transactions(&transactions)
+            .expect("transactions should apply");
+        let header = Header::new(
+            [0x99u8; 32],
+            1,
+            [0x55u8; 32],
+            expected_result.transactions_root,
+            expected_result.receipts_root,
+            1_700_000_001,
+        );
+        let block = Block::new(header, transactions);
+
+        let result = state.process_block(&block);
+
+        assert_eq!(
+            result,
+            Err(ExecutionError::HeaderStateRootMismatch {
+                expected: [0x55u8; 32],
+                actual: expected_result.post_state_root,
+            })
+        );
+        assert_eq!(state.root_hash(), root);
         assert_eq!(state.get_account(alice).unwrap().balance, 1_000);
         assert_eq!(state.get_account(bob).unwrap().balance, 50);
     }
