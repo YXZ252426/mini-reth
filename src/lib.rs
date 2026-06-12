@@ -11,7 +11,7 @@ pub use account::{Account, AccountDecodeError, AccountTrie};
 pub use crypto::keccak256;
 pub use execution::{
     Block, BlockDecodeError, ExecutionError, ExecutionResult, Header, HeaderDecodeError, State,
-    StateError, build_header, build_block
+    StateError, build_header, build_block, build_genesis_state
 };
 pub use mpt::{
     MemoryNodeDb, MptNode, MptNodeDb, MptTrie, Nibble, NodeDatabase, NodeRef, verify_mpt_proof,
